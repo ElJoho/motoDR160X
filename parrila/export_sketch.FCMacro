@@ -1,0 +1,193 @@
+# -*- coding: utf-8 -*-
+# export_sketch.FCMacro
+#
+# Saves a sketch as a PNG image and a PDF at real size (1:1), including its
+# construction geometry, which a normal export leaves out.
+#   normal geometry       -> black solid lines
+#   construction geometry -> blue dashed lines
+#   external geometry     -> magenta dotted lines
+#   points                -> small crosses
+# Dimensions and other constraints are not drawn.
+#
+# How to run:
+#   1. Click the sketch in the tree (or have it open for editing).
+#   2. File > Open this file, then click the "Execute macro" button
+#      (the green triangle) or use Macro > Execute macro.
+# The files are saved next to your .FCStd as <file>_<sketch>.png and .pdf.
+# To print at real size, print the PDF at "Actual size" / 100 %.
+
+import math
+import os
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from PySide import QtCore, QtGui
+
+# ---- settings ---------------------------------------------------------------
+SKETCH_LABEL = ""            # "" = the sketch being edited or selected, or a label
+FORMATS = ("png", "pdf")     # which files to write
+DPI = 300                    # resolution of the PNG
+INCLUDE_CONSTRUCTION = True
+INCLUDE_EXTERNAL = True      # projected / intersected geometry (magenta)
+INCLUDE_POINTS = True
+SHOW_AXES = False            # draw the sketch's horizontal and vertical axes
+MARGIN_MM = 5.0              # white border around the drawing, in mm
+NORMAL_WIDTH_MM = 0.35
+THIN_WIDTH_MM = 0.25         # construction, external and axes
+POINT_SIZE_MM = 2.0
+NORMAL_COLOR = (0, 0, 0)
+CONSTRUCTION_COLOR = (0, 90, 220)
+EXTERNAL_COLOR = (200, 0, 200)
+AXES_COLOR = (150, 150, 150)
+OUTPUT = ""                  # "" = next to the .FCStd, or a path without extension
+# -----------------------------------------------------------------------------
+
+NORMAL, CONSTRUCTION, EXTERNAL, AXES = "normal", "construction", "external", "axes"
+STYLE = {  # kind: (color, width in mm, dash pattern in mm or None)
+    NORMAL: (NORMAL_COLOR, NORMAL_WIDTH_MM, None),
+    CONSTRUCTION: (CONSTRUCTION_COLOR, THIN_WIDTH_MM, (3.0, 1.5)),
+    EXTERNAL: (EXTERNAL_COLOR, THIN_WIDTH_MM, (1.0, 1.0)),
+    AXES: (AXES_COLOR, THIN_WIDTH_MM, (6.0, 1.5, 1.0, 1.5)),
+}
+
+
+def get_sketch(doc):
+    if SKETCH_LABEL:
+        found = doc.getObjectsByLabel(SKETCH_LABEL)
+        if not found:
+            raise RuntimeError("Nothing is labelled '%s' in this document." % SKETCH_LABEL)
+        return found[0]
+    gui_doc = Gui.ActiveDocument
+    in_edit = gui_doc.getInEdit() if gui_doc else None
+    if in_edit and in_edit.Object.isDerivedFrom("Sketcher::SketchObject"):
+        return in_edit.Object
+    selection = Gui.Selection.getSelection()
+    if len(selection) == 1 and selection[0].isDerivedFrom("Sketcher::SketchObject"):
+        return selection[0]
+    raise RuntimeError("Click one sketch in the tree first (or set SKETCH_LABEL).")
+
+
+def shape_items(geo, kind):
+    """Drawable items for one geometry: ('line', [(x, y), ...]) or ('point', (x, y))."""
+    if isinstance(geo, Part.Point):
+        return [("point", kind, (geo.X, geo.Y))] if INCLUDE_POINTS else []
+    pts = geo.toShape().discretize(Deflection=0.005)
+    return [("line", kind, [(p.x, p.y) for p in pts])]
+
+
+def collect(sketch):
+    internal = {c.First for c in sketch.Constraints if c.Type == "InternalAlignment"}
+    items = []
+    for i, geo in enumerate(sketch.Geometry):
+        if i in internal:
+            continue  # B-spline control points, ellipse axes, etc.
+        construction = sketch.getConstruction(i)
+        if construction and not INCLUDE_CONSTRUCTION:
+            continue
+        items += shape_items(geo, CONSTRUCTION if construction else NORMAL)
+    if INCLUDE_EXTERNAL:
+        for geo in sketch.ExternalGeo[2:]:  # the first two are the sketch axes
+            items += shape_items(geo, EXTERNAL)
+    return items
+
+
+def make_pen(kind, px_per_mm):
+    color, width_mm, dashes = STYLE[kind]
+    pen = QtGui.QPen(QtGui.QColor(*color))
+    pen.setWidthF(width_mm * px_per_mm)
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+    if dashes:
+        pen.setDashPattern([d / width_mm for d in dashes])
+    return pen
+
+
+def draw(painter, items, box, px_per_mm):
+    min_x, max_y = box[0], box[3]
+
+    def to_px(x, y):
+        return QtCore.QPointF((x - min_x) * px_per_mm, (max_y - y) * px_per_mm)
+
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    if SHOW_AXES:
+        painter.setPen(make_pen(AXES, px_per_mm))
+        painter.drawLine(to_px(box[0], 0), to_px(box[2], 0))
+        painter.drawLine(to_px(0, box[1]), to_px(0, box[3]))
+    half = POINT_SIZE_MM / 2
+    for kind in (CONSTRUCTION, EXTERNAL, NORMAL):  # normal geometry on top
+        pen = make_pen(kind, px_per_mm)
+        point_pen = QtGui.QPen(pen)
+        point_pen.setStyle(QtCore.Qt.PenStyle.SolidLine)
+        for item_type, item_kind, data in items:
+            if item_kind != kind:
+                continue
+            if item_type == "line":
+                path = QtGui.QPainterPath(to_px(*data[0]))
+                for x, y in data[1:]:
+                    path.lineTo(to_px(x, y))
+                painter.setPen(pen)
+                painter.drawPath(path)
+            else:
+                x, y = data
+                painter.setPen(point_pen)
+                painter.drawLine(to_px(x - half, y), to_px(x + half, y))
+                painter.drawLine(to_px(x, y - half), to_px(x, y + half))
+
+
+def export_sketch():
+    doc = App.ActiveDocument
+    if doc is None:
+        raise RuntimeError("No document is open.")
+    sketch = get_sketch(doc)
+    items = collect(sketch)
+    if not items:
+        raise RuntimeError("'%s' has nothing to draw." % sketch.Label)
+
+    xs, ys = [], []
+    for item_type, _, data in items:
+        pts = data if item_type == "line" else [data]
+        xs += [p[0] for p in pts]
+        ys += [p[1] for p in pts]
+    pad = MARGIN_MM + max(NORMAL_WIDTH_MM, POINT_SIZE_MM)
+    box = (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+    width_mm, height_mm = box[2] - box[0], box[3] - box[1]
+
+    base = OUTPUT
+    if not base:
+        name = "".join(c if c.isalnum() or c in "-_." else "_" for c in sketch.Label)
+        folder = os.path.dirname(doc.FileName) if doc.FileName else os.path.expanduser("~")
+        doc_name = os.path.splitext(os.path.basename(doc.FileName))[0] if doc.FileName else doc.Name
+        base = os.path.join(folder, "%s_%s" % (doc_name, name))
+    print("%s: %.1f x %.1f mm" % (sketch.Label, width_mm, height_mm))
+
+    if "png" in FORMATS:
+        px_per_mm = DPI / 25.4
+        image = QtGui.QImage(int(math.ceil(width_mm * px_per_mm)),
+                             int(math.ceil(height_mm * px_per_mm)),
+                             QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtGui.QColor(255, 255, 255))
+        painter = QtGui.QPainter(image)
+        draw(painter, items, box, px_per_mm)
+        painter.end()
+        dots_per_meter = int(round(DPI / 0.0254))
+        image.setDotsPerMeterX(dots_per_meter)
+        image.setDotsPerMeterY(dots_per_meter)
+        if not image.save(base + ".png", "PNG"):
+            raise RuntimeError("Could not write %s.png" % base)
+        print("  saved %s.png (%d x %d px, %d dpi)" % (base, image.width(), image.height(), DPI))
+
+    if "pdf" in FORMATS:
+        pdf = QtGui.QPdfWriter(base + ".pdf")
+        pdf.setPageSize(QtGui.QPageSize(QtCore.QSizeF(width_mm, height_mm),
+                                        QtGui.QPageSize.Unit.Millimeter, "sketch",
+                                        QtGui.QPageSize.SizeMatchPolicy.ExactMatch))
+        pdf.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0), QtGui.QPageLayout.Unit.Millimeter)
+        pdf.setResolution(1200)
+        painter = QtGui.QPainter(pdf)
+        draw(painter, items, box, pdf.resolution() / 25.4)
+        painter.end()
+        print("  saved %s.pdf (%.1f x %.1f mm page, print at actual size)" % (base, width_mm, height_mm))
+
+
+export_sketch()
